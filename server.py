@@ -109,15 +109,36 @@ def upload_to_supabase_storage(local_path, public_folder=""):
     try:
         with open(local_path, "rb") as f:
             data = f.read()
-        file_key = f"{public_folder}/{Path(local_path).name}"
+        # Ensure no leading/trailing slashes produce malformed keys
+        folder = str(public_folder or "").strip("/ ")
+        file_key = f"{folder}/{Path(local_path).name}" if folder else f"{Path(local_path).name}"
         content_type, _ = mimetypes.guess_type(str(local_path))
         if not content_type:
             content_type = "image/jpeg"
+        print(f"[INFO] Uploading to Supabase bucket='{BUCKET_NAME}' key='{file_key}' content_type='{content_type}' size={len(data)}")
 
-        supabase.storage.from_(BUCKET_NAME).upload(
+        res = supabase.storage.from_(BUCKET_NAME).upload(
             file_key, data, {"content-type": content_type}, upsert=True
         )
-        return supabase.storage.from_(BUCKET_NAME).get_public_url(file_key)
+
+        # Some supabase client versions return a Response-like object; print for debugging
+        try:
+            print(f"[DEBUG] Supabase upload response: {res}")
+        except Exception:
+            pass
+
+        # get_public_url may return dict or string depending on client; normalize it
+        public = supabase.storage.from_(BUCKET_NAME).get_public_url(file_key)
+        if isinstance(public, dict) and public.get("publicUrl"):
+            public_url = public.get("publicUrl")
+        elif isinstance(public, dict) and public.get("public_url"):
+            public_url = public.get("public_url")
+        else:
+            # If it's a string already, use it; otherwise stringify for logs
+            public_url = public if isinstance(public, str) else str(public)
+
+        print(f"[INFO] Public URL: {public_url}")
+        return public_url
     except Exception as e:
         print(f"[ERROR] Supabase upload failed: {e}")
         return None
