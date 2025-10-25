@@ -44,6 +44,11 @@ TESSERACT_CMD = os.getenv("TESSERACT_CMD") or "/usr/bin/tesseract"
 if os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
+# Telegram Bot Configuration
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    print("[WARNING] TELEGRAM_BOT_TOKEN not set - Telegram image fetching will not work")
+
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
@@ -82,6 +87,43 @@ model.fuse()  # Optimizes layers for faster inference
 # ======================================================
 # HELPER FUNCTIONS
 # ======================================================
+
+def download_image_from_telegram(file_id):
+    """Downloads image from Telegram servers using file_id"""
+    try:
+        if not TELEGRAM_BOT_TOKEN:
+            raise ValueError("TELEGRAM_BOT_TOKEN not configured")
+        
+        # Get file path from Telegram API
+        get_file_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
+        print(f"[INFO] Fetching file info from Telegram: {file_id}")
+        
+        response = requests.get(get_file_url, timeout=10)
+        response.raise_for_status()
+        
+        result = response.json()
+        if not result.get("ok"):
+            raise ValueError(f"Telegram API error: {result.get('description', 'Unknown error')}")
+        
+        file_path = result["result"]["file_path"]
+        print(f"[INFO] Telegram file_path: {file_path}")
+        
+        # Download the actual file
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        print(f"[INFO] Downloading image from Telegram...")
+        
+        img_response = requests.get(download_url, timeout=30)
+        img_response.raise_for_status()
+        
+        img_bytes = img_response.content
+        print(f"[INFO] Downloaded {len(img_bytes)} bytes from Telegram")
+        
+        return img_bytes
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to download from Telegram: {e}")
+        raise
+
 
 def run_ocr_on_crop(crop, save_name=None):
     """Runs Tesseract OCR on cropped plate image"""
@@ -177,6 +219,147 @@ def index():
 def test():
     return jsonify({"status": "ok", "message": "Test successful"})
 
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    """Webhook endpoint for Telegram Bot - automatically processes images sent to bot"""
+    try:
+        data = request.get_json()
+        print(f"[TELEGRAM] Webhook received: {data}")
+        
+        # Extract message data
+        message = data.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        
+        # Check for photo
+        photo = message.get("photo")
+        if not photo:
+            print("[TELEGRAM] No photo in message")
+            return jsonify({"status": "ok", "message": "No photo received"}), 200
+        
+        # Get the largest photo (last in array)
+        largest_photo = photo[-1]
+        file_id = largest_photo.get("file_id")
+        
+        if not file_id:
+            print("[TELEGRAM] No file_id in photo")
+            return jsonify({"status": "ok", "message": "No file_id"}), 200
+        
+        print(f"[TELEGRAM] Processing photo with file_id: {file_id}")
+        
+        # Download image from Telegram
+        img_bytes = download_image_from_telegram(file_id)
+        
+        # Decode image
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            print("[ERROR] Failed to decode Telegram image")
+            return jsonify({"status": "error", "message": "Invalid image"}), 200
+        
+        print(f"[INFO] Image decoded successfully: {img.shape}")
+        
+        # Save raw image locally
+        filename = datetime.now().strftime("%Y%m%d_%H%M%S_telegram.jpg")
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        cv2.imwrite(save_path, img)
+        print(f"[INFO] Image saved to {save_path}")
+        
+        # Upload original image to Supabase storage first
+        camera_id = f"TELEGRAM_{chat_id}"
+        original_url = upload_to_supabase_storage(save_path, camera_id)
+        print(f"[INFO] Original image uploaded to Supabase: {original_url}")
+        
+        # Run YOLO detection
+        print("[INFO] Running YOLO detection...")
+        results = model.predict(img, conf=0.5, imgsz=320, device="cpu", verbose=False)
+        annotated = img.copy()
+        detected_plates = []
+        
+        # Process results
+        for r in results:
+            if not hasattr(r, "boxes") or r.boxes is None or len(r.boxes) == 0:
+                continue
+            
+            boxes = r.boxes.xyxy.cpu().numpy()
+            class_ids = r.boxes.cls.cpu().numpy().astype(int)
+            confs = r.boxes.conf.cpu().numpy()
+            
+            print(f"[INFO] Found {len(boxes)} detections")
+            
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box[:4])
+                confidence = float(confs[i])
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                class_name = model.names[class_ids[i]] if hasattr(model, "names") else str(class_ids[i])
+                if class_name.lower() != "plate":
+                    continue
+                
+                print(f"[INFO] Plate detected with confidence: {confidence:.2f}")
+                
+                # Draw detection box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(annotated, f"{class_name} {confidence:.2f}", (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                # Crop and OCR
+                crop = img[y1:y2, x1:x2]
+                crop_name = f"{os.path.splitext(filename)[0]}_plate_{i}.jpg"
+                crop_path = os.path.join(OUTPUT_DIR, crop_name)
+                cv2.imwrite(crop_path, crop)
+                
+                plate_text = run_ocr_on_crop(crop, crop_name)
+                print(f"[INFO] OCR result: {plate_text or 'unreadable'}")
+                
+                # Upload cropped plate to Supabase
+                plate_url = upload_to_supabase_storage(crop_path, camera_id)
+                
+                detected_plates.append({
+                    "file": crop_name,
+                    "text": plate_text or "unreadable",
+                    "plate_url": plate_url,
+                    "confidence": confidence
+                })
+        
+        # Save annotated image
+        ann_name = f"{os.path.splitext(filename)[0]}_annotated.jpg"
+        ann_path = os.path.join(ANNOTATED_DIR, ann_name)
+        cv2.imwrite(ann_path, annotated)
+        scene_url = upload_to_supabase_storage(ann_path, camera_id)
+        print(f"[INFO] Annotated image uploaded to Supabase: {scene_url}")
+        
+        # Log to database
+        if not detected_plates:
+            print("[INFO] No plates detected in Telegram image")
+            insert_plate_record(camera_id, "no_plate_detected", 0.0, None, scene_url)
+        else:
+            print(f"[INFO] Logging {len(detected_plates)} plates to database")
+            for dp in detected_plates:
+                insert_plate_record(camera_id, dp["text"], dp["confidence"], dp.get("plate_url"), scene_url)
+        
+        # Clean up
+        del img, annotated
+        cv2.destroyAllWindows()
+        
+        print("[SUCCESS] Telegram webhook processed successfully\n")
+        
+        # Respond to Telegram (200 OK is important for webhooks)
+        return jsonify({
+            "status": "ok",
+            "plates_detected": len(detected_plates),
+            "scene_url": scene_url
+        }), 200
+        
+    except Exception as e:
+        error_details = traceback.format_exc()
+        print(f"[ERROR] Telegram webhook failed: {e}")
+        print(f"[ERROR] Traceback:\n{error_details}")
+        
+        # Still return 200 to Telegram to avoid retries
+        return jsonify({"status": "error", "message": str(e)}), 200
+
 @app.route("/upload", methods=["GET"])
 def upload_info():
     """Info page for /upload endpoint - responds to GET requests"""
@@ -195,7 +378,7 @@ def upload_info():
 
 @app.route("/upload", methods=["GET", "POST"])
 def upload_image():
-    """Main route: receives image, runs detection + OCR, uploads to Supabase"""
+    """Main route: receives image or Telegram file_id, runs detection + OCR, uploads to Supabase"""
     
     # Handle GET requests - return endpoint info
     if request.method == "GET":
@@ -203,12 +386,16 @@ def upload_image():
             "endpoint": "/upload",
             "method": "POST",
             "status": "ready",
-            "message": "This endpoint accepts POST requests with image data",
+            "message": "This endpoint accepts POST requests with image data or Telegram file_id",
             "expected_fields": {
-                "image": "multipart/form-data file (required)",
+                "telegram_file_id": "string (Telegram file_id for fetching from Telegram)",
+                "image": "multipart/form-data file (for direct upload)",
                 "camera_id": "string (optional, defaults to CAM1)"
             },
-            "example": "curl -X POST https://your-domain/upload -F 'camera_id=CAM1' -F 'image=@photo.jpg'"
+            "examples": [
+                "curl -X POST https://your-domain/upload -H 'Content-Type: application/json' -d '{\"telegram_file_id\": \"ABC123\", \"camera_id\": \"CAM1\"}'",
+                "curl -X POST https://your-domain/upload -F 'camera_id=CAM1' -F 'image=@photo.jpg'"
+            ]
         }), 200
     
     # Handle POST requests - process image
@@ -224,27 +411,45 @@ def upload_image():
     try:
         # Get camera ID
         camera_id = request.form.get("camera_id") or request.headers.get("X-Camera-ID", "CAM1")
+        
+        # Check for JSON data (Telegram webhook format)
+        if request.is_json:
+            json_data = request.get_json()
+            camera_id = json_data.get("camera_id", camera_id)
+            telegram_file_id = json_data.get("telegram_file_id")
+        else:
+            telegram_file_id = request.form.get("telegram_file_id")
+        
         print(f"[INFO] Camera ID: {camera_id}")
 
-        # Get image bytes - FIXED ORDER OF CHECKING
+        # Get image bytes - prioritize Telegram file_id
         img_bytes = None
+        source = None
         
-        # First, check if it's multipart form data with "image" field
-        if "image" in request.files:
+        # Priority 1: Telegram file_id
+        if telegram_file_id:
+            print(f"[INFO] Telegram file_id provided: {telegram_file_id}")
+            img_bytes = download_image_from_telegram(telegram_file_id)
+            source = "telegram"
+        # Priority 2: Multipart form data with "image" field
+        elif "image" in request.files:
             print("[INFO] Image found in request.files['image']")
             img_bytes = request.files["image"].read()
-        # Then check for "file" field (alternative name)
+            source = "direct_upload"
+        # Priority 3: "file" field (alternative name)
         elif "file" in request.files:
             print("[INFO] Image found in request.files['file']")
             img_bytes = request.files["file"].read()
-        # Finally check raw request data
+            source = "direct_upload"
+        # Priority 4: Raw request data
         elif request.data and len(request.data) > 0:
             print("[INFO] Image found in request.data")
             img_bytes = request.data
+            source = "raw_data"
         else:
-            print("[ERROR] No image data found in request")
+            print("[ERROR] No image data or telegram_file_id found in request")
             return jsonify({
-                "error": "No image data received",
+                "error": "No image data or telegram_file_id received",
                 "debug": {
                     "content_type": request.content_type,
                     "form_keys": list(request.form.keys()),
@@ -257,7 +462,7 @@ def upload_image():
             print("[ERROR] Image data is empty")
             return jsonify({"error": "Empty image data received"}), 400
 
-        print(f"[INFO] Received {len(img_bytes)} bytes of image data")
+        print(f"[INFO] Received {len(img_bytes)} bytes of image data from {source}")
 
         # Decode image
         np_arr = np.frombuffer(img_bytes, np.uint8)
