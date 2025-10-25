@@ -437,13 +437,21 @@ def upload_image():
         }), 500
 
 
-@app.route("/telegram-webhook", methods=["POST"])
+@app.route("/telegram-webhook", methods=["POST", "GET"])
 def telegram_webhook():
     """
     Telegram webhook endpoint - automatically processes images sent to bot
     
     ⚠️ SETUP REQUIRED: After deploying, visit /setup-webhook to configure
     """
+    # Handle GET requests (for Telegram verification)
+    if request.method == "GET":
+        return jsonify({
+            "status": "ok",
+            "message": "Telegram webhook endpoint is active",
+            "note": "This endpoint receives POST requests from Telegram"
+        }), 200
+    
     try:
         data = request.get_json()
         print(f"[TELEGRAM] Webhook received: {data}")
@@ -512,6 +520,30 @@ def telegram_webhook():
         traceback.print_exc()
         # Always return 200 to Telegram to avoid retries
         return jsonify({"ok": True}), 200
+
+
+@app.route("/check-webhook", methods=["GET"])
+def check_webhook():
+    """Check current Telegram webhook status"""
+    try:
+        if not TELEGRAM_BOT_TOKEN:
+            return jsonify({"error": "TELEGRAM_BOT_TOKEN not configured"}), 500
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return jsonify({
+                "status": "success",
+                "webhook_info": data.get("result", {}),
+                "current_url": data.get("result", {}).get("url", "Not set")
+            })
+        else:
+            return jsonify({"error": response.text}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/setup-webhook", methods=["GET"])
